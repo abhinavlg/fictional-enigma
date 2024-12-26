@@ -468,32 +468,84 @@ stati(struct inode *ip, struct stat *st)
 // Caller must hold ip->lock.
 // If user_dst==1, then dst is a user virtual address;
 // otherwise, dst is a kernel address.
-int
-readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
-{
-  uint tot, m;
-  struct buf *bp;
+int readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n) {
+    uint tot, m;
+    struct buf *bp;
 
-  if(off > ip->size || off + n < off)
-    return 0;
-  if(off + n > ip->size)
-    n = ip->size - off;
+    if (off > ip->size || off + n < off)
+        return 0;
+    if (off + n > ip->size)
+        n = ip->size - off;
 
-  for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
-    uint addr = bmap(ip, off/BSIZE);
-    if(addr == 0)
-      break;
-    bp = bread(ip->dev, addr);
-    m = min(n - tot, BSIZE - off%BSIZE);
-    if(either_copyout(user_dst, dst, bp->data + (off % BSIZE), m) == -1) {
-      brelse(bp);
-      tot = -1;
-      break;
+    // Check for compression only at start of file
+    if (ip->type == T_FILE && off == 0) {
+        // Read first block to check compression header
+        bp = bread(ip->dev, bmap(ip, 0));
+        struct compression_header ch;
+        memmove(&ch, bp->data, sizeof(ch));
+        brelse(bp);
+
+        if (ch.compressed == 1) {
+            printf("readi: found compressed file, original length %d\n", ch.length);
+            
+            // Allocate buffers
+            char *comp_buf = kalloc();
+            char *decomp_buf = kalloc();
+            
+            if (!comp_buf || !decomp_buf) {
+                if (comp_buf) kfree(comp_buf);
+                if (decomp_buf) kfree(decomp_buf);
+                return -1;
+            }
+
+            // Read compressed data (skipping header)
+            int comp_size = ip->size - sizeof(ch);
+            tot = 0;
+            while (tot < comp_size) {
+                bp = bread(ip->dev, bmap(ip, (tot + sizeof(ch)) / BSIZE));
+                m = min(comp_size - tot, BSIZE - ((tot + sizeof(ch)) % BSIZE));
+                memmove(comp_buf + tot, bp->data + ((tot + sizeof(ch)) % BSIZE), m);
+                brelse(bp);
+                tot += m;
+            }
+
+            // Decompress
+            int decomp_size = decompress_rle(comp_buf, comp_size, decomp_buf, ch.length);
+            if (decomp_size < 0) {
+                kfree(comp_buf);
+                kfree(decomp_buf);
+                return -1;
+            }
+
+            // Copy requested portion to user
+            m = min(n, decomp_size - off);
+            if (either_copyout(user_dst, dst, decomp_buf + off, m) == -1) {
+                kfree(comp_buf);
+                kfree(decomp_buf);
+                return -1;
+            }
+
+            kfree(comp_buf);
+            kfree(decomp_buf);
+            return m;
+        }
     }
-    brelse(bp);
-  }
-  return tot;
+
+    // Regular uncompressed read
+    for(tot = 0; tot < n; tot += m, off += m, dst += m) {
+        bp = bread(ip->dev, bmap(ip, off / BSIZE));
+        m = min(n - tot, BSIZE - off % BSIZE);
+        if(either_copyout(user_dst, dst, bp->data + (off % BSIZE), m) == -1) {
+            brelse(bp);
+            return -1;
+        }
+        brelse(bp);
+    }
+    
+    return tot;
 }
+
+
 
 // Write data to inode.
 // Caller must hold ip->lock.
@@ -502,41 +554,97 @@ readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
 // Returns the number of bytes successfully written.
 // If the return value is less than the requested n,
 // there was an error of some kind.
-int
-writei(struct inode *ip, int user_src, uint64 src, uint off, uint n)
-{
-  uint tot, m;
-  struct buf *bp;
+int writei(struct inode *ip, int user_src, uint64 src, uint off, uint n) {
+    uint tot, m;
+    struct buf *bp;
 
-  if(off > ip->size || off + n < off)
-    return -1;
-  if(off + n > MAXFILE*BSIZE)
-    return -1;
+    if (off > ip->size || off + n < off)
+        return -1;
+    if (off + n > MAXFILE * BSIZE)
+        return -1;
 
-  for(tot=0; tot<n; tot+=m, off+=m, src+=m){
-    uint addr = bmap(ip, off/BSIZE);
-    if(addr == 0)
-      break;
-    bp = bread(ip->dev, addr);
-    m = min(n - tot, BSIZE - off%BSIZE);
-    if(either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
-      brelse(bp);
-      break;
+    // Only try compression for:
+    // - Regular files
+    // - Writing from start of file
+    if (ip->type == T_FILE && off == 0) {
+        char *temp_buf = kalloc();
+        char *comp_buf = kalloc();
+        
+        if (!temp_buf || !comp_buf) {
+            if (temp_buf) kfree(temp_buf);
+            if (comp_buf) kfree(comp_buf);
+            return -1;
+        }
+
+        // Copy data to temporary buffer
+        if (either_copyin(temp_buf, user_src, src, n) == -1) {
+            kfree(temp_buf);
+            kfree(comp_buf);
+            return -1;
+        }
+
+        // Try to compress the data
+        int comp_size = compress_rle(temp_buf, n, comp_buf, PGSIZE);
+        printf("writei: original %d bytes, compressed %d bytes, with header would be %lu bytes\n", 
+               n, comp_size, comp_size + sizeof(struct compression_header));
+
+        // Only use compression if it saves at least 1 byte including header
+        if (comp_size > 0 && (comp_size + sizeof(struct compression_header)) < n) {
+            printf("writei: using compression\n");
+            struct compression_header ch;
+            ch.compressed = 1;
+            ch.length = n;
+
+            // Write header
+            bp = bread(ip->dev, bmap(ip, 0));
+            memmove(bp->data, &ch, sizeof(ch));
+            log_write(bp);
+            brelse(bp);
+
+            // Write compressed data
+            tot = 0;
+            while (tot < comp_size) {
+                bp = bread(ip->dev, bmap(ip, (tot + sizeof(ch)) / BSIZE));
+                m = min(comp_size - tot, BSIZE - ((tot + sizeof(ch)) % BSIZE));
+                memmove(bp->data + ((tot + sizeof(ch)) % BSIZE), comp_buf + tot, m);
+                log_write(bp);
+                brelse(bp);
+                tot += m;
+            }
+
+            ip->size = comp_size + sizeof(ch);
+            iupdate(ip);
+
+            kfree(temp_buf);
+            kfree(comp_buf);
+            return n;
+        } else {
+            printf("writei: compression not beneficial, using original\n");
+        }
+
+        kfree(temp_buf);
+        kfree(comp_buf);
     }
-    log_write(bp);
-    brelse(bp);
-  }
 
-  if(off > ip->size)
-    ip->size = off;
+    // Regular uncompressed write
+    for(tot = 0; tot < n; tot += m, off += m, src += m) {
+        bp = bread(ip->dev, bmap(ip, off / BSIZE));
+        m = min(n - tot, BSIZE - off % BSIZE);
+        if(either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
+            brelse(bp);
+            return -1;
+        }
+        log_write(bp);
+        brelse(bp);
+    }
 
-  // write the i-node back to disk even if the size didn't change
-  // because the loop above might have called bmap() and added a new
-  // block to ip->addrs[].
-  iupdate(ip);
+    if(off > ip->size)
+        ip->size = off;
 
-  return tot;
+    iupdate(ip);
+    return n;
 }
+
 
 // Directories
 
@@ -695,3 +803,5 @@ nameiparent(char *path, char *name)
 {
   return namex(path, 1, name);
 }
+
+void iupdate(struct inode*);

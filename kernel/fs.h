@@ -58,3 +58,12 @@ struct dirent {
   char name[DIRSIZ];
 };
 
+#define T_COMPRESSED 4  // New flag for compressed files
+
+struct compression_header {
+  int compressed;  // 1 if compressed, 0 if not
+  int length;      // original uncompressed length
+};
+
+int compress_rle(char *input, int inlen, char *output, int maxlen);
+int decompress_rle(char *input, int inlen, char *output, int maxlen);
