@@ -61,9 +61,17 @@ struct dirent {
 #define T_COMPRESSED 4  // New flag for compressed files
 
 struct compression_header {
-  int compressed;  // 1 if compressed, 0 if not
-  int length;      // original uncompressed length
+  int compressed;         // 1 if compressed, 0 if not
+  int length;            // original uncompressed length
+  int tree_size;         // size of huffman tree data
 };
 
-int compress_rle(char *input, int inlen, char *output, int maxlen);
-int decompress_rle(char *input, int inlen, char *output, int maxlen);
+struct huffman_node {
+  unsigned char c;       // character
+  int freq;             // frequency
+  int left;             // left child index
+  int right;            // right child index
+};
+
+int compress_huffman(char *input, int inlen, char *output, int maxlen);
+int decompress_huffman(char *input, int inlen, char *output, int maxlen);

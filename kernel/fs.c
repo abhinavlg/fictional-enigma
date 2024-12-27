@@ -471,14 +471,17 @@ stati(struct inode *ip, struct stat *st)
 int readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n) {
     uint tot, m;
     struct buf *bp;
+    static char *cached_decomp_buf = 0;  // Static buffer to cache decompressed data
+    static int cached_inum = 0;          // Cache the inode number
+    static int cached_length = 0;        // Cache the original length
 
     if (off > ip->size || off + n < off)
         return 0;
     if (off + n > ip->size)
         n = ip->size - off;
 
-    // Check for compression only at start of file
-    if (ip->type == T_FILE && off == 0) {
+    // Check for compression
+    if (ip->type == T_FILE) {
         // Read first block to check compression header
         bp = bread(ip->dev, bmap(ip, 0));
         struct compression_header ch;
@@ -488,46 +491,65 @@ int readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n) {
         if (ch.compressed == 1) {
             printf("readi: found compressed file, original length %d\n", ch.length);
             
-            // Allocate buffers
-            char *comp_buf = kalloc();
-            char *decomp_buf = kalloc();
-            
-            if (!comp_buf || !decomp_buf) {
-                if (comp_buf) kfree(comp_buf);
-                if (decomp_buf) kfree(decomp_buf);
-                return -1;
-            }
+            // Check if we need to decompress (not cached or different file)
+            if (cached_decomp_buf == 0 || cached_inum != ip->inum) {
+                // Free old cache if it exists
+                if (cached_decomp_buf) {
+                    kfree(cached_decomp_buf);
+                    cached_decomp_buf = 0;
+                }
+                
+                // Allocate buffers
+                char *comp_buf = kalloc();
+                cached_decomp_buf = kalloc();
+                
+                if (!comp_buf || !cached_decomp_buf) {
+                    if (comp_buf) kfree(comp_buf);
+                    if (cached_decomp_buf) cached_decomp_buf = 0;
+                    return -1;
+                }
 
-            // Read compressed data (skipping header)
-            int comp_size = ip->size - sizeof(ch);
-            tot = 0;
-            while (tot < comp_size) {
-                bp = bread(ip->dev, bmap(ip, (tot + sizeof(ch)) / BSIZE));
-                m = min(comp_size - tot, BSIZE - ((tot + sizeof(ch)) % BSIZE));
-                memmove(comp_buf + tot, bp->data + ((tot + sizeof(ch)) % BSIZE), m);
-                brelse(bp);
-                tot += m;
-            }
+                // Read compressed data (skipping header)
+                int comp_size = ip->size - sizeof(ch);
+                tot = 0;
+                while (tot < comp_size) {
+                    bp = bread(ip->dev, bmap(ip, (tot + sizeof(ch)) / BSIZE));
+                    m = min(comp_size - tot, BSIZE - ((tot + sizeof(ch)) % BSIZE));
+                    memmove(comp_buf + tot, bp->data + ((tot + sizeof(ch)) % BSIZE), m);
+                    brelse(bp);
+                    tot += m;
+                }
 
-            // Decompress
-            int decomp_size = decompress_rle(comp_buf, comp_size, decomp_buf, ch.length);
-            if (decomp_size < 0) {
+                // Decompress
+                int decomp_size = decompress_huffman(comp_buf, comp_size, cached_decomp_buf, ch.length);
                 kfree(comp_buf);
-                kfree(decomp_buf);
-                return -1;
+                
+                if (decomp_size < 0) {
+                    kfree(cached_decomp_buf);
+                    cached_decomp_buf = 0;
+                    return -1;
+                }
+
+                cached_inum = ip->inum;
+                cached_length = ch.length;
+            }
+
+            // Validate offset and length
+            if (off >= cached_length) {
+                return 0;
+            }
+
+            // Adjust n if it would read past end of original file
+            if (off + n > cached_length) {
+                n = cached_length - off;
             }
 
             // Copy requested portion to user
-            m = min(n, decomp_size - off);
-            if (either_copyout(user_dst, dst, decomp_buf + off, m) == -1) {
-                kfree(comp_buf);
-                kfree(decomp_buf);
+            if (either_copyout(user_dst, dst, cached_decomp_buf + off, n) == -1) {
                 return -1;
             }
 
-            kfree(comp_buf);
-            kfree(decomp_buf);
-            return m;
+            return n;
         }
     }
 
@@ -583,66 +605,51 @@ int writei(struct inode *ip, int user_src, uint64 src, uint off, uint n) {
             return -1;
         }
 
-        // Try to compress the data
-        int comp_size = compress_rle(temp_buf, n, comp_buf, PGSIZE);
-        printf("writei: original %d bytes, compressed %d bytes, with header would be %lu bytes\n", 
-               n, comp_size, comp_size + sizeof(struct compression_header));
+        // Only compress if the file is larger than the header size and has repetitive content
+        if(ip->type == T_FILE && n > sizeof(struct compression_header)) {
+            char *comp_buf = kalloc();
+            if(comp_buf) {
+                int comp_size = compress_huffman(temp_buf, n, comp_buf, PGSIZE);
+                
+                // Only use compression if it actually saves space
+                if(comp_size > 0 && comp_size + sizeof(struct compression_header) < n) {
+                    struct compression_header ch;
+                    ch.compressed = 1;
+                    ch.length = n;
+                    ch.tree_size = comp_size;
+                    
+                    // Write header and compressed data
+                    memmove(bp->data, &ch, sizeof(ch));
+                    memmove(bp->data + sizeof(ch), comp_buf, comp_size);
+                    kfree(comp_buf);
+                    log_write(bp);
+                    brelse(bp);
+                    return n;
+                }
+                kfree(comp_buf);
+            }
+        }
 
-        // Only use compression if it saves at least 1 byte including header
-        if (comp_size > 0 && (comp_size + sizeof(struct compression_header)) < n) {
-            printf("writei: using compression\n");
-            struct compression_header ch;
-            ch.compressed = 1;
-            ch.length = n;
-
-            // Write header
-            bp = bread(ip->dev, bmap(ip, 0));
-            memmove(bp->data, &ch, sizeof(ch));
+        // Regular uncompressed write
+        for(tot = 0; tot < n; tot += m, off += m, src += m) {
+            bp = bread(ip->dev, bmap(ip, off / BSIZE));
+            m = min(n - tot, BSIZE - off % BSIZE);
+            if(either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
+                brelse(bp);
+                return -1;
+            }
             log_write(bp);
             brelse(bp);
-
-            // Write compressed data
-            tot = 0;
-            while (tot < comp_size) {
-                bp = bread(ip->dev, bmap(ip, (tot + sizeof(ch)) / BSIZE));
-                m = min(comp_size - tot, BSIZE - ((tot + sizeof(ch)) % BSIZE));
-                memmove(bp->data + ((tot + sizeof(ch)) % BSIZE), comp_buf + tot, m);
-                log_write(bp);
-                brelse(bp);
-                tot += m;
-            }
-
-            ip->size = comp_size + sizeof(ch);
-            iupdate(ip);
-
-            kfree(temp_buf);
-            kfree(comp_buf);
-            return n;
-        } else {
-            printf("writei: compression not beneficial, using original\n");
         }
 
-        kfree(temp_buf);
-        kfree(comp_buf);
+        if(off > ip->size)
+            ip->size = off;
+
+        iupdate(ip);
+        return n;
     }
 
-    // Regular uncompressed write
-    for(tot = 0; tot < n; tot += m, off += m, src += m) {
-        bp = bread(ip->dev, bmap(ip, off / BSIZE));
-        m = min(n - tot, BSIZE - off % BSIZE);
-        if(either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
-            brelse(bp);
-            return -1;
-        }
-        log_write(bp);
-        brelse(bp);
-    }
-
-    if(off > ip->size)
-        ip->size = off;
-
-    iupdate(ip);
-    return n;
+    return -1;
 }
 
 
