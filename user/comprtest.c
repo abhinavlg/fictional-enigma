@@ -56,72 +56,100 @@ int read_file(char *filename, char *buf, int max_size) {
     return bytes_read;
 }
 
+// Print readable content and hex dump
+void print_data(char *data, int len) {
+    printf("\nContent (%d bytes):\n", len);
+    write(1, data, len);
+    printf("\n\nHex dump:\n");
+    
+    for(int i = 0; i < len; i++) {
+        if(i % 16 == 0) {
+            if(i > 0) {
+                printf("  ");
+                // Print ASCII for previous line
+                for(int j = i-16; j < i; j++) {
+                    char c = data[j];
+                    printf("%c", (c >= 32 && c <= 126) ? c : '.');
+                }
+                printf("\n");
+            }
+            printf("%04x:", i);
+        }
+        printf(" %02x", (unsigned char)data[i]);
+    }
+    
+    // Print padding spaces for last line
+    int remaining = len % 16;
+    if(remaining > 0) {
+        for(int i = 0; i < (16-remaining)*3; i++)
+            printf(" ");
+    }
+    
+    // Print ASCII for last line
+    printf("  ");
+    int start = len - (len % 16);
+    for(int i = start; i < len; i++) {
+        char c = data[i];
+        printf("%c", (c >= 32 && c <= 126) ? c : '.');
+    }
+    printf("\n\n");
+}
+
 // Test compression with detailed output
 void test_compression(char *test_name, char *data, int len) {
     printf("\n=== Test Case: %s ===\n", test_name);
-    printf("Original Data (%d bytes):\n", len);
-    print_data_sample(data, len);
     
-    // Create and write to test file
-    int fd = open("test.txt", O_WRONLY | O_CREATE);
+    // Create temporary test file
+    char *filename = "temp.txt";
+    int fd = open(filename, O_CREATE | O_WRONLY);
     if(fd < 0) {
         printf("Failed to create test file\n");
-        exit(1);
+        return;
     }
     
-    // Write the original data
+    // Write test data
     if(write(fd, data, len) != len) {
-        printf("Failed to write test file\n");
+        printf("Failed to write test data\n");
         close(fd);
-        exit(1);
+        return;
     }
     close(fd);
     
-    // Get file stats before reading back
+    // Print original data
+    printf("\nOriginal data:");
+    print_data(data, len);
+    
+    // Get file stats
     struct stat st;
-    if(stat("test.txt", &st) < 0) {
+    if(stat(filename, &st) < 0) {
         printf("Failed to get file stats\n");
-        exit(1);
+        unlink(filename);
+        return;
     }
     
-    printf("\nFile Statistics:\n");
+    printf("\nCompression results:\n");
+    printf("Original size: %d bytes\n", len);
     printf("Size on disk: %d bytes\n", (int)st.size);
     
     // Read back and verify
-    fd = open("test.txt", O_RDONLY);
+    fd = open(filename, O_RDONLY);
     if(fd < 0) {
         printf("Failed to open file for reading\n");
-        exit(1);
+        unlink(filename);
+        return;
     }
     
-    char *read_buf = malloc(len + 1);
-    if(!read_buf) {
-        printf("Failed to allocate read buffer\n");
-        close(fd);
-        exit(1);
-    }
-    
-    int bytes_read = read(fd, read_buf, len);
+    char buf[1024];
+    int n = read(fd, buf, sizeof(buf));
     close(fd);
-    read_buf[bytes_read] = '\0';
     
-    printf("\nVerification:\n");
-    printf("Bytes read back: %d\n", bytes_read);
-    printf("Read Data:\n");
-    print_data_sample(read_buf, bytes_read);
-    
-    // Compare original and read data
-    int match = (bytes_read == len && memcmp(data, read_buf, len) == 0);
-    printf("\nVerification Result: %s\n", match ? "PASSED" : "FAILED");
-    if (!match) {
-        printf("Expected length: %d, Got: %d\n", len, bytes_read);
-        if (bytes_read == len) {
-            printf("Data content mismatch!\n");
-        }
+    if(n != len || memcmp(data, buf, len) != 0) {
+        printf("Data verification failed!\n");
+    } else {
+        printf("Data verification passed\n");
     }
     
-    free(read_buf);
-    unlink("test.txt");
+    unlink(filename);
 }
 
 void test_file(char *filename) {
@@ -138,7 +166,7 @@ void test_file(char *filename) {
     }
 
     printf("\nTesting file: %s\n", filename);
-    test_compression("File Compression Test", buf, size);
+    test_compression(filename, buf, size);
     free(buf);
 }
 

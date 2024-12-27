@@ -41,30 +41,29 @@ void print_help() {
 }
 
 void handle_input(char c) {
-    static int last_was_newline = 0;
+    // Don't process command characters as text
+    if(c == '$' || c == '@') {
+        return;
+    }
     
     if(c == KEY_RETURN || c == KEY_NEWLINE) {
-        if(!last_was_newline) {  // Only handle if not duplicate
-            if(len < MAXLINE-1) {
-                buf[len++] = '\n';
-                buf[len] = '\0';
-                write(1, "\n", 1);
-            }
-            last_was_newline = 1;
+        if(len < MAXLINE-1) {
+            buf[len++] = '\n';
+            buf[len] = '\0';
+            // Don't echo newline - terminal handles it
         }
     } else {
-        last_was_newline = 0;
         if(c == KEY_DEL || c == '\b') {
             if(len > 0) {
                 len--;
                 buf[len] = '\0';
-                write(1, "\b \b", 3);
+                // Terminal handles backspace display
             }
         }
         else if(len < MAXLINE-1 && c >= 32 && c < 127) {
-            write(1, &c, 1);  // Echo the character first
             buf[len++] = c;
             buf[len] = '\0';
+            // Don't echo character - terminal handles it
         }
     }
 }
@@ -88,18 +87,17 @@ int main(int argc, char *argv[]) {
     }
     
     char c;
-    char confirm;
     while(1) {
         if(read(0, &c, 1) <= 0) 
             break;
 
-        // Special commands
         if(c == '$') {  // Save
             save_file(filename);
             continue;
         }
         if(c == '@') {  // Exit
             printf("\nExit? (y/n): ");
+            char confirm;
             while(read(0, &confirm, 1) > 0) {
                 if(confirm == 'y' || confirm == 'Y') {
                     exit(0);
@@ -112,7 +110,6 @@ int main(int argc, char *argv[]) {
             continue;
         }
         
-        // Handle regular input
         handle_input(c);
     }
     

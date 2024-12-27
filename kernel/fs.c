@@ -580,76 +580,84 @@ int writei(struct inode *ip, int user_src, uint64 src, uint off, uint n) {
     uint tot, m;
     struct buf *bp;
 
-    if (off > ip->size || off + n < off)
+    if(off > ip->size || off + n < off)
         return -1;
-    if (off + n > MAXFILE * BSIZE)
+    if(off + n > MAXFILE * BSIZE)
         return -1;
 
-    // Only try compression for:
-    // - Regular files
-    // - Writing from start of file
-    if (ip->type == T_FILE && off == 0) {
+    // Only try compression for regular files and writing from start
+    if(ip->type == T_FILE && off == 0) {
         char *temp_buf = kalloc();
-        char *comp_buf = kalloc();
-        
-        if (!temp_buf || !comp_buf) {
-            if (temp_buf) kfree(temp_buf);
-            if (comp_buf) kfree(comp_buf);
+        if(!temp_buf)
             return -1;
-        }
 
         // Copy data to temporary buffer
-        if (either_copyin(temp_buf, user_src, src, n) == -1) {
+        if(either_copyin(temp_buf, user_src, src, n) == -1) {
             kfree(temp_buf);
-            kfree(comp_buf);
             return -1;
         }
 
-        // Only compress if the file is larger than the header size and has repetitive content
-        if(ip->type == T_FILE && n > sizeof(struct compression_header)) {
+        // Try compression if file is larger than minimum size
+        if(n > sizeof(struct compression_header)) {
             char *comp_buf = kalloc();
             if(comp_buf) {
-                int comp_size = compress_huffman(temp_buf, n, comp_buf, PGSIZE);
+                printf("Attempting compression of %d bytes...\n", n);
                 
-                // Only use compression if it actually saves space
-                if(comp_size > 0 && comp_size + sizeof(struct compression_header) < n) {
+                // Attempt compression
+                int comp_size = compress_huffman(temp_buf, n, comp_buf, PGSIZE);
+                printf("Compression result: %d bytes\n", comp_size);
+                
+                // Use compression if it saves space
+                if(comp_size > 0 && comp_size < n) {
+                    printf("Using compressed data (saved %d bytes)\n", n - comp_size);
+                    
                     struct compression_header ch;
+                    ch.magic = COMPRESSION_MAGIC;
                     ch.compressed = 1;
                     ch.length = n;
                     ch.tree_size = comp_size;
-                    
+
                     // Write header and compressed data
-                    memmove(bp->data, &ch, sizeof(ch));
-                    memmove(bp->data + sizeof(ch), comp_buf, comp_size);
-                    kfree(comp_buf);
-                    log_write(bp);
-                    brelse(bp);
-                    return n;
+                    bp = bread(ip->dev, bmap(ip, 0));
+                    if(bp) {
+                        memmove(bp->data, &ch, sizeof(ch));
+                        memmove(bp->data + sizeof(ch), comp_buf, comp_size);
+                        log_write(bp);
+                        brelse(bp);
+                        
+                        ip->size = comp_size + sizeof(ch);
+                        iupdate(ip);
+                        
+                        kfree(temp_buf);
+                        kfree(comp_buf);
+                        return n;  // Return original size
+                    }
+                } else {
+                    printf("Compression not beneficial, using original data\n");
                 }
                 kfree(comp_buf);
             }
         }
-
-        // Regular uncompressed write
-        for(tot = 0; tot < n; tot += m, off += m, src += m) {
-            bp = bread(ip->dev, bmap(ip, off / BSIZE));
-            m = min(n - tot, BSIZE - off % BSIZE);
-            if(either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
-                brelse(bp);
-                return -1;
-            }
-            log_write(bp);
-            brelse(bp);
-        }
-
-        if(off > ip->size)
-            ip->size = off;
-
-        iupdate(ip);
-        return n;
+        kfree(temp_buf);
     }
 
-    return -1;
+    // Regular uncompressed write for non-regular files or non-start writes
+    for(tot = 0; tot < n; tot += m, off += m, src += m) {
+        bp = bread(ip->dev, bmap(ip, off / BSIZE));
+        m = min(n - tot, BSIZE - off % BSIZE);
+        if(either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
+            brelse(bp);
+            break;
+        }
+        log_write(bp);
+        brelse(bp);
+    }
+
+    if(off > ip->size)
+        ip->size = off;
+
+    iupdate(ip);
+    return tot;
 }
 
 

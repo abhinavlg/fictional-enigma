@@ -60,10 +60,13 @@ struct dirent {
 
 #define T_COMPRESSED 4  // New flag for compressed files
 
+#define COMPRESSION_MAGIC 0x436F6D70  // "Comp" in ASCII
+
 struct compression_header {
-  int compressed;         // 1 if compressed, 0 if not
-  int length;            // original uncompressed length
-  int tree_size;         // size of huffman tree data
+    uint magic;           // Magic number to identify compressed files
+    uint compressed;      // Flag indicating if file is compressed
+    uint length;         // Original uncompressed length
+    uint tree_size;      // Size of the Huffman tree data
 };
 
 struct huffman_node {

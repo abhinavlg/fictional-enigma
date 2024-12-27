@@ -105,6 +105,9 @@ void write_bit(char *output, int *byte_pos, int *bit_pos, int bit) {
 
 // Compress using Huffman coding
 int compress_huffman(char *input, int inlen, char *output, int maxlen) {
+    // Add debug prints
+    printf("Building Huffman tree for %d bytes...\n", inlen);
+    
     if (!input || !output || inlen <= 0 || maxlen <= 0)
         return -1;
 
@@ -146,6 +149,13 @@ int compress_huffman(char *input, int inlen, char *output, int maxlen) {
     if (bit_pos > 0)
         byte_pos++;
         
+    // Add size checks
+    if(byte_pos >= inlen) {
+        printf("Compression ineffective (got %d bytes)\n", byte_pos);
+        return -1;
+    }
+    
+    printf("Compressed to %d bytes\n", byte_pos);
     return byte_pos;
 }
 
