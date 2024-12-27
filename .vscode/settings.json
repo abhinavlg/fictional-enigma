@@ -1,9 +1,0 @@
-{
-    "files.associations": {
-        "*.css": "tailwindcss",
-        "stat.h": "c",
-        "spinlock.h": "c",
-        "proc.h": "c",
-        "types.h": "c"
-    }
-}
